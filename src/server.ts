@@ -10,8 +10,51 @@ import {
   tool
 } from "ai";
 import { z } from "zod";
+import { generateText } from "ai";
 
-export class ChatAgent extends AIChatAgent<Env> {
+
+type Action = "retry" | "rollback" | "escalate";
+
+type Incident = {
+  id: string;
+  service: string;
+  metric: string;
+  value: number;
+  detectedAt: string;
+  recommendedAction: Action;
+  reasoning: string;
+  finalAction: Action;
+  policyOverride: boolean;
+};
+
+type DeployWatchState = {
+  checksRun: number;
+  incidents: Incident[];
+};
+
+
+const POLICY = {
+  escalateAboveErrorRate: 40
+};
+
+function applyPolicy(
+  value: number,
+  recommended: Action
+): { finalAction: Action; policyOverride: boolean } {
+  if (value > POLICY.escalateAboveErrorRate) {
+    return {
+      finalAction: "escalate",
+      policyOverride: recommended !== "escalate"
+    };
+  }
+  return { finalAction: recommended, policyOverride: false };
+}
+
+export class ChatAgent extends AIChatAgent<Env, DeployWatchState>  {
+  initialState: DeployWatchState = {
+    checksRun: 0,
+    incidents: []
+  };
   maxPersistedMessages = 100;
   chatRecovery = true;
   // Wait for MCP connections to be re-established after hibernation before
@@ -19,6 +62,7 @@ export class ChatAgent extends AIChatAgent<Env> {
   waitForMcpConnections = true;
 
   onStart() {
+    this.scheduleEvery(30, "runHealthCheck");
     // Configure OAuth popup behavior for MCP servers that require authentication
     this.mcp.configureOAuthCallback({
       customHandler: (result) => {
@@ -46,15 +90,17 @@ export class ChatAgent extends AIChatAgent<Env> {
     await this.removeMcpServer(serverId);
   }
 
-  async onChatMessage(_onFinish: unknown, options?: OnChatMessageOptions) {
+  async onChatMessage(onFinish: any, options?: OnChatMessageOptions) {
     const mcpTools = this.mcp.getAITools();
     const workersai = createWorkersAI({ binding: this.env.AI });
 
     const result = streamText({
-      model: workersai("@cf/moonshotai/kimi-k2.7-code", {
-        sessionAffinity: this.sessionAffinity
-      }),
-      system: `You are a helpful assistant that can understand images. You can check the weather, get the user's timezone, run calculations, and schedule tasks. When users share images, describe what you see and answer questions about them.
+      model: workersai("@cf/meta/llama-3.3-70b-instruct-fp8-fast"),
+      system: `You are DeployWatch, a deployment reliability agent that monitors services for anomalies.
+
+Only call getIncidentHistory when the user explicitly asks about incidents, services, errors, or what you have detected. For greetings or general questions, just reply conversationally without calling any tool.
+
+When you do report incidents, summarize concisely: affected service, error rate, and the action taken.
 
 ${getSchedulePrompt({ date: new Date() })}
 
@@ -70,60 +116,12 @@ If the user asks to schedule a task, use the schedule tool to schedule the task.
         ...mcpTools,
 
         // Server-side tool: runs automatically on the server
-        getWeather: tool({
-          description: "Get the current weather for a city",
-          inputSchema: z.object({
-            city: z.string().describe("City name")
-          }),
-          execute: async ({ city }) => {
-            // Replace with a real weather API in production
-            const conditions = ["sunny", "cloudy", "rainy", "snowy"];
-            const temp = Math.floor(Math.random() * 30) + 5;
-            return {
-              city,
-              temperature: temp,
-              condition:
-                conditions[Math.floor(Math.random() * conditions.length)],
-              unit: "celsius"
-            };
-          }
-        }),
-
-        // Client-side tool: no execute function — the browser handles it
-        getUserTimezone: tool({
-          description:
-            "Get the user's timezone from their browser. Use this when you need to know the user's local time.",
-          inputSchema: z.object({})
-        }),
-
-        // Approval tool: requires user confirmation before executing
-        calculate: tool({
-          description:
-            "Perform a math calculation with two numbers. Requires user approval for large numbers.",
-          inputSchema: z.object({
-            a: z.number().describe("First number"),
-            b: z.number().describe("Second number"),
-            operator: z
-              .enum(["+", "-", "*", "/", "%"])
-              .describe("Arithmetic operator")
-          }),
-          needsApproval: async ({ a, b }) =>
-            Math.abs(a) > 1000 || Math.abs(b) > 1000,
-          execute: async ({ a, b, operator }) => {
-            const ops: Record<string, (x: number, y: number) => number> = {
-              "+": (x, y) => x + y,
-              "-": (x, y) => x - y,
-              "*": (x, y) => x * y,
-              "/": (x, y) => x / y,
-              "%": (x, y) => x % y
-            };
-            if (operator === "/" && b === 0) {
-              return { error: "Division by zero" };
-            }
-            return {
-              expression: `${a} ${operator} ${b}`,
-              result: ops[operator](a, b)
-            };
+        getIncidentHistory: tool({
+          description: "Get the list of detected deployment incidents and the action taken for each",
+          inputSchema: z.object({}),
+          execute: async () => {
+            const recent = this.state.incidents.slice(-10);
+            return recent.length > 0 ? recent : "No incidents detected yet.";
           }
         }),
 
@@ -180,10 +178,93 @@ If the user asks to schedule a task, use the schedule tool to schedule the task.
         })
       },
       stopWhen: stepCountIs(20),
+      onFinish,
       abortSignal: options?.abortSignal
     });
 
     return result.toUIMessageStreamResponse();
+  }
+
+  async diagnose(
+    service: string,
+    metric: string,
+    value: number
+  ): Promise<{ action: Action; reasoning: string }> {
+    const prompt = `You are a deployment reliability agent.
+
+Incident:
+- service: ${service}
+- metric: ${metric}
+- value: ${value}%
+
+Choose ONE action:
+- "retry" if the value is low (under 20) and likely transient
+- "rollback" if the value is high (20 or more) and the service is degraded
+- "escalate" if it is severe (over 40) and needs a human
+
+Respond with ONLY valid JSON, no other text:
+{"action": "retry", "reasoning": "one short sentence"}`;
+
+    const result = await this.env.AI.run(
+      "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+      { messages: [{ role: "user", content: prompt }] }
+    );
+
+    const raw = (result as { response: unknown }).response;
+
+    try {
+      const parsed = typeof raw === "string" ? JSON.parse(raw.trim()) : raw;
+      return {
+        action: parsed.action as Action,
+        reasoning: parsed.reasoning as string
+      };
+    } catch {
+      console.log("LLM returned unparseable output:", raw);
+      return { action: "escalate", reasoning: "Could not parse LLM response" };
+    }
+  }
+
+  
+    async runHealthCheck() {
+    const services = ["checkout-api", "auth-service", "payments-worker"];
+    const service = services[Math.floor(Math.random() * services.length)];
+    const metric = "error_rate";
+    const isAnomaly = Math.random() < 0.4;
+
+    if (isAnomaly) {
+      const value = Math.floor(Math.random() * 60) + 10;
+
+      const diagnosis = await this.diagnose(service, metric, value);
+      const policy = applyPolicy(value, diagnosis.action);
+
+      const incident: Incident = {
+        id: crypto.randomUUID(),
+        service,
+        metric,
+        value,
+        detectedAt: new Date().toISOString(),
+        recommendedAction: diagnosis.action,
+        reasoning: diagnosis.reasoning,
+        finalAction: policy.finalAction,
+        policyOverride: policy.policyOverride
+      };
+
+      this.setState({
+        checksRun: this.state.checksRun + 1,
+        incidents: [...this.state.incidents, incident]
+      });
+
+      console.log(
+        `INCIDENT ${service} ${value}% | LLM: ${diagnosis.action} → FINAL: ${policy.finalAction}` +
+          (policy.policyOverride ? " [POLICY OVERRIDE]" : "")
+      );
+    } else {
+      this.setState({
+        checksRun: this.state.checksRun + 1,
+        incidents: this.state.incidents
+      });
+      console.log("Health check OK. Total checks:", this.state.checksRun);
+    }
   }
 
   async executeTask(description: string, _task: Schedule<string>) {
