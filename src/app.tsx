@@ -820,6 +820,15 @@ function Chat() {
                       );
                     }
 
+                    function dedupeTokens(text: string): string {
+                      return text
+                        .replace(/\b([A-Za-z']+)(\s+)\1\b/g, "$1")
+                        .replace(/([A-Za-z']{2,}?)\1/g, "$1")
+                        .replace(/([.,!?;:])\1+/g, "$1")
+                        .replace(/\b([A-Za-z]+)\1(?=')/g, "$1");
+                        
+                    }
+
                     return (
                       <div key={key} className="flex justify-start">
                         <div className="max-w-[85%] rounded-2xl rounded-bl-md bg-kumo-base text-kumo-default leading-relaxed">
@@ -829,7 +838,7 @@ function Chat() {
                             controls={false}
                             isAnimating={isLastAssistant && isStreaming}
                           >
-                            {part.text}
+                            {dedupeTokens(part.text)}
                           </Streamdown>
                         </div>
                       </div>
