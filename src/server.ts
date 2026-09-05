@@ -50,6 +50,40 @@ function applyPolicy(
   return { finalAction: recommended, policyOverride: false };
 }
 
+// ── Evaluation scenarios ──────────────────────────────────────────────
+
+const EVAL_CASES: { value: number; expected: Action }[] = [
+  // Baseline extremes
+  { value: 5, expected: "retry" },
+  { value: 15, expected: "retry" },
+  { value: 85, expected: "escalate" },
+
+  // Boundary: 19 (just below retry threshold) — repeated to catch non-determinism
+  { value: 19, expected: "retry" },
+  { value: 19, expected: "retry" },
+  { value: 19, expected: "retry" },
+
+  // Boundary: 21 (just above retry threshold) — repeated
+  { value: 21, expected: "rollback" },
+  { value: 21, expected: "rollback" },
+  { value: 21, expected: "rollback" },
+
+  // Mid-range
+  { value: 30, expected: "rollback" },
+  { value: 35, expected: "rollback" },
+
+  // Boundary: 39 (just below escalate threshold) — repeated
+  { value: 39, expected: "rollback" },
+  { value: 39, expected: "rollback" },
+
+  // Boundary: 41 (just above escalate threshold) — repeated
+  { value: 41, expected: "escalate" },
+  { value: 41, expected: "escalate" },
+
+  // High extreme
+  { value: 55, expected: "escalate" },
+];
+
 export class ChatAgent extends AIChatAgent<Env, DeployWatchState>  {
   initialState: DeployWatchState = {
     checksRun: 0,
@@ -62,7 +96,7 @@ export class ChatAgent extends AIChatAgent<Env, DeployWatchState>  {
   waitForMcpConnections = true;
 
   onStart() {
-    this.scheduleEvery(30, "runHealthCheck");
+    // this.scheduleEvery(30, "runHealthCheck");  // disabled for now to avoid continuous background check to save neurons
     // Configure OAuth popup behavior for MCP servers that require authentication
     this.mcp.configureOAuthCallback({
       customHandler: (result) => {
@@ -175,7 +209,13 @@ If the user asks to schedule a task, use the schedule tool to schedule the task.
               return `Error cancelling task: ${error}`;
             }
           }
-        })
+        }),
+
+        runEvaluation: tool({
+          description: "Run the diagnosis evaluation suite against fixed scenarios and report accuracy and policy override rate",
+          inputSchema: z.object({}),
+          execute: async () => await this.runEvals()
+        }),
       },
       stopWhen: stepCountIs(20),
       onFinish,
@@ -189,7 +229,7 @@ If the user asks to schedule a task, use the schedule tool to schedule the task.
     service: string,
     metric: string,
     value: number
-  ): Promise<{ action: Action; reasoning: string }> {
+  ): Promise<{ action: Action; reasoning: string; failed: boolean }> {
     const prompt = `You are a deployment reliability agent.
 
 Incident:
@@ -205,27 +245,109 @@ Choose ONE action:
 Respond with ONLY valid JSON, no other text:
 {"action": "retry", "reasoning": "one short sentence"}`;
 
-    const result = await this.env.AI.run(
-      "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-      { messages: [{ role: "user", content: prompt }] }
-    );
-
-    const raw = (result as { response: unknown }).response;
+    let raw: unknown;
+    try {
+      const result = await this.env.AI.run(
+        "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        { messages: [{ role: "user", content: prompt }] }
+      );
+      raw = (result as { response: unknown }).response;
+    } catch (error) {
+      // Inference itself failed (quota, network, model unavailable).
+      // Not a model decision — evals must not score this as one.
+      console.log("Inference call failed:", error);
+      return {
+        action: "escalate",
+        reasoning: "INFERENCE_ERROR: diagnosis unavailable",
+        failed: true
+      };
+    }
 
     try {
       const parsed = typeof raw === "string" ? JSON.parse(raw.trim()) : raw;
       return {
         action: parsed.action as Action,
-        reasoning: parsed.reasoning as string
+        reasoning: parsed.reasoning as string,
+        failed: false
       };
     } catch {
       console.log("LLM returned unparseable output:", raw);
-      return { action: "escalate", reasoning: "Could not parse LLM response" };
+      return {
+        action: "escalate",
+        reasoning: "PARSE_ERROR: could not parse model response",
+        failed: true
+      };
     }
   }
 
+  @callable()
+  async runEvals() {
+    const results: {
+      value: number;
+      expected: Action;
+      recommended: Action;
+      finalAction: Action;
+      policyOverride: boolean;
+      reasoning: string;
+      modelCorrect: boolean;
+    }[] = [];
+
+    const service = "checkout-api";
+    const metric = "error_rate";
+
+    for (const testCase of EVAL_CASES) {
+      const diagnosis = await this.diagnose(service, metric, testCase.value);
+
+      if (diagnosis.failed) {
+        return {
+          error: "Inference failed mid-run; partial results discarded.",
+          detail: diagnosis.reasoning,
+          completedBeforeFailure: results.length
+        };
+      }
+
+      const policy = applyPolicy(testCase.value, diagnosis.action);
+
+      results.push({
+        value: testCase.value,
+        expected: testCase.expected,
+        recommended: diagnosis.action,
+        finalAction: policy.finalAction,
+        policyOverride: policy.policyOverride,
+        reasoning: diagnosis.reasoning,
+        modelCorrect: diagnosis.action === testCase.expected
+      });
+    }
+
+    const total = results.length;
+    const correct = results.filter((r) => r.modelCorrect).length;
+    const overrides = results.filter((r) => r.policyOverride).length;
+
+    // Non-determinism: same input run more than once — did the model agree with itself?
+    const byValue = new Map<number, Set<Action>>();
+    for (const r of results) {
+      if (!byValue.has(r.value)) byValue.set(r.value, new Set());
+      byValue.get(r.value)!.add(r.recommended);
+    }
+    const inconsistent = [...byValue.entries()]
+      .filter(([, actions]) => actions.size > 1)
+      .map(([value, actions]) => ({ value, actions: [...actions] }));
+
+    return {
+      summary: {
+        totalRuns: total,
+        modelCorrect: correct,
+        modelAccuracy: `${Math.round((correct / total) * 100)}%`,
+        policyOverrides: overrides,
+        overrideRate: `${Math.round((overrides / total) * 100)}%`,
+        inconsistentValues: inconsistent
+      },
+      details: results
+    };
+  }
+
   
-    async runHealthCheck() {
+  async runHealthCheck() {
     const services = ["checkout-api", "auth-service", "payments-worker"];
     const service = services[Math.floor(Math.random() * services.length)];
     const metric = "error_rate";
