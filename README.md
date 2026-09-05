@@ -1,245 +1,220 @@
-# Agent Starter
+# DeployWatch
 
-![npm i agents command](./npm-agents-banner.svg)
+An autonomous deployment-monitoring agent on Cloudflare Workers. It detects
+service anomalies on a schedule, asks an LLM what to do about them, and then
+**ignores the LLM if policy says otherwise.**
 
-<a href="https://deploy.workers.cloudflare.com/?url=https://github.com/cloudflare/agents-starter"><img src="https://deploy.workers.cloudflare.com/button" alt="Deploy to Cloudflare"/></a>
+**Live:** https://deploywatch-agent.akshaya-cp.workers.dev
 
-A starter template for building AI chat agents on Cloudflare, powered by the [Agents SDK](https://developers.cloudflare.com/agents/).
+---
 
-Uses Workers AI (no API key required), with tools for weather, timezone detection, calculations with approval, task scheduling, and vision (image input).
+## Thesis
 
-## Quick start
+An LLM cannot be trusted to act on production infrastructure. The response to
+that is not to make the model more trustworthy — it is to make it *powerless*.
+
+The model proposes. A deterministic policy layer disposes.
+
+Every design decision in this repo follows from that sentence. Where the model
+is wrong, the system is still right; where the model is unavailable, the system
+still fails safe.
+
+---
+
+## What it does
+
+```
+   TIMER ──> runHealthCheck ──> diagnose (LLM) ──> applyPolicy ──> setState ──┐
+                                                                              │
+                                                                    state (Durable Object)
+                                                                              │
+   HUMAN ──> onChatMessage ──> getIncidentHistory ─────────────────────────────┘
+```
+
+Two independent entry points, one shared durable memory. The agent works when
+nobody is watching; the chat interface is a window onto what it did.
+
+1. **Detect** — a scheduled health check runs on an interval and flags anomalies.
+2. **Diagnose** — the anomaly is sent to Llama 3.3 on Workers AI, which returns
+   a recommended action (`retry` / `rollback` / `escalate`) and its reasoning.
+3. **Decide** — `applyPolicy()` re-derives the correct action from the raw
+   metric, independent of what the model said. Disagreements are recorded, not
+   silently resolved.
+4. **Remember** — the incident, the model's recommendation, the final action,
+   and whether policy overrode the model are persisted to Durable Object state.
+5. **Explain** — a chat interface queries that history conversationally.
+
+---
+
+## Why the policy layer exists
+
+Not as decoration. It was added in response to an observed failure.
+
+During development the agent classified a **49% error rate as `rollback`**, when
+the prompt explicitly specified `escalate` for anything above 40%. The model's
+reasoning was fluent and plausible. It was also wrong, and a fluent wrong answer
+that triggers an automated rollback is worse than no answer at all.
+
+So the threshold logic was moved out of the model:
+
+```ts
+function applyPolicy(value: number, recommended: Action) {
+  if (value > POLICY.escalateAboveErrorRate) {
+    return { finalAction: "escalate", policyOverride: recommended !== "escalate" };
+  }
+  return { finalAction: recommended, policyOverride: false };
+}
+```
+
+The policy never reads the model's output to decide. It reads the raw number.
+The model's answer is only used to *detect disagreement*, which is recorded as
+`policyOverride` so the audit trail explains why an action differed from the
+recommendation.
+
+**Known limitation:** the current policy only guards the high end. A model error
+in the other direction — recommending `retry` for a 21% error rate — passes
+through unchallenged. Closing that gap is v2 work.
+
+---
+
+## Evaluation
+
+`runEvals()` runs fixed scenarios through the full `diagnose() → applyPolicy()`
+path and reports three things: how often the model was right, how often policy
+had to override it, and whether the model agrees with *itself* on repeated
+identical inputs.
+
+Scenarios cluster at decision boundaries (19/21, 39/41), with repeats, because
+that is where a fuzzy classifier fails and where a deterministic guardrail earns
+its place.
+
+<!-- V2: replace with actual output of runEvals() -->
+| Metric | Result |
+|---|---|
+| Total runs | _pending_ |
+| Model accuracy | _pending_ |
+| Policy override rate | _pending_ |
+| Inconsistent on repeated input | _pending_ |
+
+**On what a good result looks like:** 100% model accuracy would be a bad
+outcome, not a good one. It would mean the task was simple enough that an
+`if/else` would have sufficed and both the LLM and the policy layer are dead
+weight. The value of this system is proportional to how often the model is
+wrong.
+
+**Measurement integrity:** `diagnose()` distinguishes an inference failure
+(quota, network, model unavailable) from a parse failure. Both fail safe to
+`escalate` in production. But evals abort rather than scoring an infrastructure
+error as a model decision — fail safe in production, fail loud in evaluation.
+
+---
+
+## Architecture notes
+
+**Why Durable Objects.** A normal Worker forgets everything between requests,
+which is fine for an API and useless for an agent tracking an ongoing incident.
+A Durable Object is a single instance with a stable identity, private storage,
+and strong consistency — no distributed locking, no race conditions, and state
+that survives restarts and deploys. An agent is a stateful object with a
+scheduler; Durable Objects are the primitive that makes that possible.
+
+**Why `scheduleEvery` and not `schedule`.** The first implementation
+self-rescheduled inside the handler and also scheduled from `onStart()`. Every
+Durable Object restart created another timer, so timers multiplied — the runtime
+eventually reported processing ten stale schedules in a single alarm cycle.
+`scheduleEvery()` is idempotent recurrence. This is a duplicate-scheduled-work
+bug, and it is the reason v2 moves to deterministic keys throughout.
+
+**Why the diagnosis path doesn't use tool calling.** Tool-argument validation
+proved unreliable with the fp8-quantized model. Rather than fight it, `diagnose()`
+requests JSON and parses it explicitly, with a fail-safe default. For anything
+that could trigger a deployment action, explicit validation beats trusting raw
+tool arguments.
+
+**Model selection.** `@cf/meta/llama-3.3-70b-instruct-fp8-fast` — Cloudflare-hosted,
+function-calling capable, available on the free tier.
+
+---
+
+## Built on
+
+This is built on [`cloudflare/agents-starter`](https://github.com/cloudflare/agents-starter),
+which provides the agent runtime, Durable Object wiring, chat UI, WebSocket
+transport, MCP client support, and scheduling primitives.
+
+**What I added:** the state schema, the monitoring loop, LLM diagnosis with
+fail-safe parsing, the policy layer, the eval harness, and the incident-history
+tool. The starter's demo tools (`getWeather`, `calculate`, `getUserTimezone`)
+were removed.
+
+---
+
+## Known issues
+
+**Duplicated tokens in streamed chat output.** Each token in the assistant's
+streamed reply renders twice.
+
+Investigated by: upgrading `agents` 0.17→0.22 and `@cloudflare/ai-chat` 0.9→0.11
+(both ship fixes for related Workers AI stream-reconciliation bugs — duplicate
+assistant messages when a provider omits `start.messageId`, and a double-ACKed
+stream resume replaying the chunk buffer); disabling `resume` and `chatRecovery`;
+passing `onFinish` through per the SDK docs; swapping models. None resolved it.
+`workers-ai-provider@4` requires `ai@7`, a major upgrade across the whole stack
+that was not justified for a display-only bug.
+
+Currently worked around at render time in `app.tsx`. **This is a workaround, not
+a fix** — it collapses the doubling but will also collapse legitimate repetition.
+It is applied only to assistant text; user input, stored incident data, and the
+non-streamed diagnosis path are unaffected.
+
+**Simulated monitoring.** Anomalies are generated, not observed. There is no
+real telemetry source. The agent architecture is the subject here; wiring a real
+metrics source is a substitution, not a redesign.
+
+---
+
+## Running it
 
 ```bash
-npx create-cloudflare@latest --template cloudflare/agents-starter
-cd agents-starter
 npm install
-npm run dev
-```
-
-> **Cloudflare authentication is required to run locally.** This template uses
-> Workers AI with `"ai": { "remote": true }` in `wrangler.jsonc`, and Workers AI
-> has no local simulator — so `npm run dev` opens a remote proxy session against
-> Cloudflare and needs you to be authenticated. Either run `wrangler login` once
-> in an interactive terminal, or set a `CLOUDFLARE_API_TOKEN` environment
-> variable (e.g. in a `.env` file). No third-party (OpenAI/Anthropic) key is
-> needed, but a Cloudflare login is.
-
-Open [http://localhost:5173](http://localhost:5173) to see your agent in action.
-
-Try these prompts to see the different features:
-
-- **"What's the weather in Paris?"** — server-side tool (runs automatically)
-- **"What timezone am I in?"** — client-side tool (browser provides the answer)
-- **"Calculate 5000 \* 3"** — approval tool (asks you before running)
-- **"Remind me in 5 minutes to take a break"** — scheduling
-- **Drop an image and ask "What's in this image?"** — vision (image understanding)
-
-## Project structure
-
-```
-src/
-  server.ts    # Chat agent with tools and scheduling
-  app.tsx      # Chat UI built with Kumo components
-  client.tsx   # React entry point
-  styles.css   # Tailwind + Kumo styles
-```
-
-## What's included
-
-- **AI Chat** — Streaming responses powered by Workers AI via `AIChatAgent`
-- **Image input** — Drag-and-drop, paste, or click to attach images for vision-capable models
-- **Three tool patterns** — server-side auto-execute, client-side (browser), and human-in-the-loop approval
-- **Scheduling** — one-time, delayed, and recurring (cron) tasks
-- **Reasoning display** — shows model thinking as it streams, collapses when done
-- **Debug mode** — toggle in the header to inspect raw message JSON for each message
-- **Kumo UI** — Cloudflare's design system with dark/light mode
-- **Real-time** — WebSocket connection with automatic reconnection and message persistence
-
-## Making it your own
-
-### Name your project
-
-Update the name in `package.json` and `wrangler.jsonc` — the `name` in `wrangler.jsonc` becomes your deployed Worker's URL (`<name>.<subdomain>.workers.dev`).
-
-### Change the system prompt
-
-Edit the `system` string in `server.ts` to give your agent a different personality or focus area. This is the most impactful single change you can make.
-
-### Replace the demo tools with real ones
-
-The starter ships with demo tools (`getWeather` returns random data, `calculate` does basic arithmetic). Replace them with real implementations:
-
-```ts
-// In server.ts, replace a demo tool with a real API call:
-getWeather: tool({
-  description: "Get the current weather for a city",
-  inputSchema: z.object({ city: z.string() }),
-  execute: async ({ city }) => {
-    const res = await fetch(`https://api.weather.example/${city}`);
-    return res.json();
-  }
-}),
-```
-
-### Add your own tools
-
-Add new tools to the `tools` object in `server.ts`. There are three patterns:
-
-```ts
-// Auto-execute: runs on the server, no user interaction
-myTool: tool({
-  description: "...",
-  inputSchema: z.object({ /* ... */ }),
-  execute: async (input) => { /* return result */ }
-}),
-
-// Client-side: no execute function, browser provides the result
-// Handle it in app.tsx via the onToolCall callback
-browserTool: tool({
-  description: "...",
-  inputSchema: z.object({ /* ... */ })
-}),
-
-// Approval: add needsApproval to gate execution
-sensitiveTool: tool({
-  description: "...",
-  inputSchema: z.object({ /* ... */ }),
-  needsApproval: async (input) => true, // or conditional logic
-  execute: async (input) => { /* runs after approval */ }
-}),
-```
-
-### Customize scheduled task behavior
-
-When a scheduled task fires, `executeTask` runs on the server. It does its work and then uses `this.broadcast()` to notify connected clients (shown as a toast notification in the UI). Replace it with your own logic:
-
-```ts
-async executeTask(description: string, task: Schedule<string>) {
-  // Do the actual work
-  await sendEmail({ to: "user@example.com", subject: description });
-
-  // Notify connected clients
-  this.broadcast(
-    JSON.stringify({ type: "scheduled-task", description, timestamp: new Date().toISOString() })
-  );
-}
-```
-
-> **Why `broadcast()` instead of `saveMessages()`?** Injecting into chat history can cause the AI to see the notification as new context and re-trigger the same task in a loop. `broadcast()` sends a one-off event that the client displays separately from the conversation.
-
-### Remove scheduling
-
-If you don't need scheduling, remove `scheduleTask`, `getScheduledTasks`, and `cancelScheduledTask` from the tools object, the `executeTask` method, and the schedule-related imports (`getSchedulePrompt`, `scheduleSchema`, `Schedule`).
-
-### Add state beyond chat messages
-
-Use `this.setState()` and `this.state` for real-time state that syncs to all connected clients. See [Store and sync state](https://developers.cloudflare.com/agents/api-reference/store-and-sync-state/).
-
-### Add callable methods
-
-Expose agent methods as typed RPC that your client can call directly:
-
-```ts
-import { callable } from "agents";
-
-export class ChatAgent extends AIChatAgent<Env> {
-  @callable()
-  async getStats() {
-    return { messageCount: this.messages.length };
-  }
-}
-
-// Client-side:
-const stats = await agent.call("getStats");
-```
-
-See [Callable methods](https://developers.cloudflare.com/agents/api-reference/callable-methods/).
-
-### Connect to MCP servers
-
-Add external tools from MCP servers:
-
-```ts
-async onChatMessage(onFinish, options) {
-  // Connect to an MCP server
-  await this.mcp.connect("https://my-mcp-server.example/sse");
-
-  const result = streamText({
-    // ...
-    tools: {
-      ...myTools,
-      ...this.mcp.getAITools() // Include MCP tools
-    }
-  });
-}
-```
-
-See [MCP Client API](https://developers.cloudflare.com/agents/api-reference/mcp-client-api/).
-
-## Use a different AI model provider
-
-The starter uses [Workers AI](https://developers.cloudflare.com/workers-ai/) by default (no API key needed). To use a different provider:
-
-### OpenAI
-
-```bash
-npm install @ai-sdk/openai
-```
-
-```ts
-// In server.ts, replace the model:
-import { openai } from "@ai-sdk/openai";
-
-// Inside onChatMessage:
-const result = streamText({
-  model: openai("gpt-5.2")
-  // ...
-});
-```
-
-Create a `.env` file with your API key:
-
-```
-OPENAI_API_KEY=your-key-here
-```
-
-### Anthropic
-
-```bash
-npm install @ai-sdk/anthropic
-```
-
-```ts
-import { anthropic } from "@ai-sdk/anthropic";
-
-const result = streamText({
-  model: anthropic("claude-sonnet-4-20250514")
-  // ...
-});
-```
-
-Create a `.env` file with your API key:
-
-```
-ANTHROPIC_API_KEY=your-key-here
-```
-
-## Deploy
-
-```bash
+npx wrangler login
+npm run dev      # http://localhost:5173
 npm run deploy
 ```
 
-Your agent is live on Cloudflare's global network. Messages persist in SQLite, streams resume on disconnect, and the agent hibernates when idle.
+Workers AI runs in remote mode — a Cloudflare login is required even for local
+development. No third-party API keys are needed.
 
-## Learn more
+---
 
-- [Agents SDK documentation](https://developers.cloudflare.com/agents/)
-- [Build a chat agent tutorial](https://developers.cloudflare.com/agents/getting-started/build-a-chat-agent/)
-- [Chat agents API reference](https://developers.cloudflare.com/agents/api-reference/chat-agents/)
-- [Workers AI models](https://developers.cloudflare.com/workers-ai/models/)
+## AI-assisted development
 
-## License
+Prompt history: [`docs/prompt-history.md`](docs/prompt-history.md)
 
-MIT
+<!-- V2: expand once the full session is curated -->
+
+---
+
+## Roadmap
+
+<!-- V2 SECTIONS SLOT IN HERE -->
+
+The current system demonstrates the propose/dispose split at its simplest: the
+model recommends, policy decides, nothing executes. The next layer is making
+execution itself safe.
+
+- **Deterministic incident keys** — derive an incident key from
+  `service + metric + window` rather than a random UUID, so the same incident
+  detected twice resolves to the same identity. This is the recovery surface
+  everything else depends on.
+- **Execution-time authorization** — expose `rollbackDeployment` as a real tool
+  whose handler re-validates policy on every call. A tool schema is not a
+  security boundary; the handler is.
+- **Idempotent remediation** — key side effects on `(incidentKey, callId)` and
+  return the cached result on replay, so a retried execution cannot double-fire
+  a rollback.
+- **Crash recovery** — demonstrate a Durable Object restart mid-remediation
+  resuming without duplicating work.
+- **Full audit trail** — persist every proposal, authorization decision, and
+  execution, not just outcomes.
+- **Bidirectional policy** — guard the low end as well as the high end.
