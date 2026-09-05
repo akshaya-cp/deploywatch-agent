@@ -10,8 +10,6 @@ import {
   tool
 } from "ai";
 import { z } from "zod";
-import { generateText } from "ai";
-
 
 type Action = "retry" | "rollback" | "escalate";
 
@@ -31,7 +29,6 @@ type DeployWatchState = {
   checksRun: number;
   incidents: Incident[];
 };
-
 
 const POLICY = {
   escalateAboveErrorRate: 40
@@ -81,16 +78,15 @@ const EVAL_CASES: { value: number; expected: Action }[] = [
   { value: 41, expected: "escalate" },
 
   // High extreme
-  { value: 55, expected: "escalate" },
+  { value: 55, expected: "escalate" }
 ];
 
-export class ChatAgent extends AIChatAgent<Env, DeployWatchState>  {
+export class ChatAgent extends AIChatAgent<Env, DeployWatchState> {
   initialState: DeployWatchState = {
     checksRun: 0,
     incidents: []
   };
   maxPersistedMessages = 100;
-  chatRecovery = true;
   // Wait for MCP connections to be re-established after hibernation before
   // processing a message, so MCP tools aren't intermittently missing.
   waitForMcpConnections = true;
@@ -124,7 +120,14 @@ export class ChatAgent extends AIChatAgent<Env, DeployWatchState>  {
     await this.removeMcpServer(serverId);
   }
 
-  async onChatMessage(onFinish: any, options?: OnChatMessageOptions) {
+  async onChatMessage(
+    // The base class types onFinish as GenerateTextOnFinishCallback, but
+    // streamText expects StreamTextOnFinishCallback. Incompatible SDK types;
+    // the callback works correctly at runtime.
+    // oxlint-disable-next-line typescript/no-explicit-any -- base class types onFinish as GenerateTextOnFinishCallback; streamText expects StreamTextOnFinishCallback. Incompatible SDK types, correct at runtime.
+    onFinish: any,
+    options?: OnChatMessageOptions
+  ) {
     const mcpTools = this.mcp.getAITools();
     const workersai = createWorkersAI({ binding: this.env.AI });
 
@@ -151,7 +154,8 @@ If the user asks to schedule a task, use the schedule tool to schedule the task.
 
         // Server-side tool: runs automatically on the server
         getIncidentHistory: tool({
-          description: "Get the list of detected deployment incidents and the action taken for each",
+          description:
+            "Get the list of detected deployment incidents and the action taken for each",
           inputSchema: z.object({}),
           execute: async () => {
             const recent = this.state.incidents.slice(-10);
@@ -212,10 +216,11 @@ If the user asks to schedule a task, use the schedule tool to schedule the task.
         }),
 
         runEvaluation: tool({
-          description: "Run the diagnosis evaluation suite against fixed scenarios and report accuracy and policy override rate",
+          description:
+            "Run the diagnosis evaluation suite against fixed scenarios and report accuracy and policy override rate",
           inputSchema: z.object({}),
           execute: async () => await this.runEvals()
-        }),
+        })
       },
       stopWhen: stepCountIs(20),
       onFinish,
@@ -346,7 +351,6 @@ Respond with ONLY valid JSON, no other text:
     };
   }
 
-  
   async runHealthCheck() {
     const services = ["checkout-api", "auth-service", "payments-worker"];
     const service = services[Math.floor(Math.random() * services.length)];

@@ -11,7 +11,7 @@ service anomalies on a schedule, asks an LLM what to do about them, and then
 ## Thesis
 
 An LLM cannot be trusted to act on production infrastructure. The response to
-that is not to make the model more trustworthy — it is to make it *powerless*.
+that is not to make the model more trustworthy — it is to make it _powerless_.
 
 The model proposes. A deterministic policy layer disposes.
 
@@ -60,14 +60,17 @@ So the threshold logic was moved out of the model:
 ```ts
 function applyPolicy(value: number, recommended: Action) {
   if (value > POLICY.escalateAboveErrorRate) {
-    return { finalAction: "escalate", policyOverride: recommended !== "escalate" };
+    return {
+      finalAction: "escalate",
+      policyOverride: recommended !== "escalate"
+    };
   }
   return { finalAction: recommended, policyOverride: false };
 }
 ```
 
 The policy never reads the model's output to decide. It reads the raw number.
-The model's answer is only used to *detect disagreement*, which is recorded as
+The model's answer is only used to _detect disagreement_, which is recorded as
 `policyOverride` so the audit trail explains why an action differed from the
 recommendation.
 
@@ -81,7 +84,7 @@ through unchallenged. Closing that gap is v2 work.
 
 `runEvals()` runs fixed scenarios through the full `diagnose() → applyPolicy()`
 path and reports three things: how often the model was right, how often policy
-had to override it, and whether the model agrees with *itself* on repeated
+had to override it, and whether the model agrees with _itself_ on repeated
 identical inputs.
 
 Scenarios cluster at decision boundaries (19/21, 39/41), with repeats, because
@@ -89,11 +92,12 @@ that is where a fuzzy classifier fails and where a deterministic guardrail earns
 its place.
 
 <!-- V2: replace with actual output of runEvals() -->
-| Metric | Result |
-|---|---|
-| Total runs | _pending_ |
-| Model accuracy | _pending_ |
-| Policy override rate | _pending_ |
+
+| Metric                         | Result    |
+| ------------------------------ | --------- |
+| Total runs                     | _pending_ |
+| Model accuracy                 | _pending_ |
+| Policy override rate           | _pending_ |
 | Inconsistent on repeated input | _pending_ |
 
 **On what a good result looks like:** 100% model accuracy would be a bad

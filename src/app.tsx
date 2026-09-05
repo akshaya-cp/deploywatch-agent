@@ -826,7 +826,6 @@ function Chat() {
                         .replace(/([A-Za-z']{2,}?)\1/g, "$1")
                         .replace(/([.,!?;:])\1+/g, "$1")
                         .replace(/\b([A-Za-z]+)\1(?=')/g, "$1");
-                        
                     }
 
                     return (

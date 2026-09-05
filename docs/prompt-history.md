@@ -33,8 +33,8 @@ async runHealthCheck() {
 
 **What went wrong:** every Durable Object restart re-ran `onStart()` and created
 another timer, while each execution also created its own successor. Timers
-multiplied. Within minutes the runtime was reporting *"Processing 10 stale
-`runHealthCheck` schedules in a single alarm cycle."* Check counts climbed to 55
+multiplied. Within minutes the runtime was reporting _"Processing 10 stale
+`runHealthCheck` schedules in a single alarm cycle."_ Check counts climbed to 55
 in five minutes instead of the expected ten.
 
 **Fix:**
@@ -69,7 +69,7 @@ calling would break the whole template), and that it wasn't slated for
 deprecation mid-project. Settled on
 `@cf/meta/llama-3.3-70b-instruct-fp8-fast`.
 
-**Lesson:** verify a model's availability *and* its capability surface before
+**Lesson:** verify a model's availability _and_ its capability surface before
 building on it. The failure mode was loud here; a model that silently lacked
 function calling would have been much harder to diagnose.
 
@@ -101,7 +101,7 @@ const parsed = typeof raw === "string" ? JSON.parse(raw.trim()) : raw;
 
 **Lesson:** the fail-safe worked — a broken parser still produced a conservative
 outcome instead of crashing or triggering something destructive. But it also
-*masked* the bug for several runs by making a parsing failure look like a model
+_masked_ the bug for several runs by making a parsing failure look like a model
 failure. A fail-safe that swallows the distinction between "the model was wrong"
 and "my code was wrong" will hide real defects. This is why `diagnose()` now
 returns a `failed` flag: fail safe in production, fail loud in evaluation.
@@ -120,7 +120,7 @@ if (diagnosis.action === "escalate") {
 }
 ```
 
-**Why that's wrong:** it checks *what the model said*. The model is still making
+**Why that's wrong:** it checks _what the model said_. The model is still making
 the decision; this only verifies it said the right word. It is a spell-checker,
 not a guardrail. If the model classifies a 49% error rate as `rollback` — which
 it did, in testing — this code passes it straight through.
@@ -140,7 +140,7 @@ function applyPolicy(value: number, recommended: Action) {
 }
 ```
 
-The model's answer is used only to *detect disagreement*, recorded as
+The model's answer is used only to _detect disagreement_, recorded as
 `policyOverride` for the audit trail.
 
 **Lesson:** this is the design error rather than a syntax error, and it is the
@@ -173,7 +173,7 @@ results.
 - **Separated infrastructure failure from model failure**, so a quota error
   can't be scored as a decision the model made.
 
-**On what a good result looks like:** 100% model accuracy would be a *bad*
+**On what a good result looks like:** 100% model accuracy would be a _bad_
 outcome. It would mean the task was simple enough for an `if/else` and that both
 the LLM and the policy layer are dead weight. The system's value is proportional
 to how often the model is wrong.
@@ -210,7 +210,7 @@ doubling. This is a workaround, not a fix. It will also collapse legitimate
 repetition, so it is applied only to assistant text — never to user input,
 stored incident data, or the non-streamed diagnosis path.
 
-**Not root-caused.** I know which layers it is *not* in. I do not know which
+**Not root-caused.** I know which layers it is _not_ in. I do not know which
 layer it is in.
 
 **Lesson:** the useful part here was recognising when to stop. Reading the
