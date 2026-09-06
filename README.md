@@ -129,6 +129,28 @@ eventually reported processing ten stale schedules in a single alarm cycle.
 `scheduleEvery()` is idempotent recurrence. This is a duplicate-scheduled-work
 bug, and it is the reason v2 moves to deterministic keys throughout.
 
+**Deterministic incident keys.** Incidents are keyed on
+`service:metric:time-bucket` rather than a random UUID, so the same incident
+detected twice resolves to the same identity. The dedup check runs *before* the
+LLM call — it prevents double-remediation, and it avoids paying for inference on
+an incident already diagnosed.
+
+The window is a fixed 5-minute bucket (`Math.floor(now / 5min)`), not a sliding
+window. Too narrow and one ongoing incident fragments into many keys, defeating
+dedup; too wide and a genuinely new incident is absorbed by an old one's key and
+goes unhandled. Five minutes is roughly how long a deployment problem stays the
+same problem.
+
+**Known tradeoff:** fixed buckets mean two anomalies seconds apart can land in
+different buckets if they straddle a boundary — 4:59:58 and 5:00:02 get
+different keys. A sliding window fixes this but requires tracking last-seen
+timestamps per service+metric. Fixed bucketing is the cheap approximation, taken
+deliberately.
+
+This is also why the state moved from `Incident[]` to `Record<string, Incident>`:
+"have I already handled this?" becomes a property of the data structure rather
+than a scan.
+
 **Why the diagnosis path doesn't use tool calling.** Tool-argument validation
 proved unreliable with the fp8-quantized model. Rather than fight it, `diagnose()`
 requests JSON and parses it explicitly, with a fail-safe default. For anything
@@ -201,16 +223,9 @@ Prompt history: [`docs/prompt-history.md`](docs/prompt-history.md)
 
 ## Roadmap
 
-<!-- V2 SECTIONS SLOT IN HERE -->
+Deterministic keys are in place, which is the foundation for the rest. The next
+layer is making execution itself safe.
 
-The current system demonstrates the propose/dispose split at its simplest: the
-model recommends, policy decides, nothing executes. The next layer is making
-execution itself safe.
-
-- **Deterministic incident keys** — derive an incident key from
-  `service + metric + window` rather than a random UUID, so the same incident
-  detected twice resolves to the same identity. This is the recovery surface
-  everything else depends on.
 - **Execution-time authorization** — expose `rollbackDeployment` as a real tool
   whose handler re-validates policy on every call. A tool schema is not a
   security boundary; the handler is.
