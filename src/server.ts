@@ -102,7 +102,7 @@ export class ChatAgent extends AIChatAgent<Env, DeployWatchState> {
   waitForMcpConnections = true;
 
   onStart() {
-    // this.scheduleEvery(30, "runHealthCheck");  // disabled for now to avoid continuous background check to save neurons
+    this.scheduleEvery(30, "runHealthCheck");
     // Configure OAuth popup behavior for MCP servers that require authentication
     this.mcp.configureOAuthCallback({
       customHandler: (result) => {
