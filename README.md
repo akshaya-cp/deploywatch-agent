@@ -78,38 +78,71 @@ recommendation.
 in the other direction — recommending `retry` for a 21% error rate — passes
 through unchallenged. Closing that gap is v2 work.
 
+The eval suite later confirmed the high-end failure systematically — see
+[Evaluation](#evaluation).
+
 ---
 
 ## Evaluation
 
-`runEvals()` runs fixed scenarios through the full `diagnose() → applyPolicy()`
-path and reports three things: how often the model was right, how often policy
-had to override it, and whether the model agrees with _itself_ on repeated
-identical inputs.
+`runEvals()` runs 16 fixed scenarios through the full `diagnose() → applyPolicy()`
+path and reports how often the model was right, how often policy had to override
+it, and whether the model agrees with _itself_ on repeated identical inputs.
 
-Scenarios cluster at decision boundaries (19/21, 39/41), with repeats, because
-that is where a fuzzy classifier fails and where a deterministic guardrail earns
-its place.
+| Metric                         | Result      |
+| ------------------------------ | ----------- |
+| Total runs                     | 16          |
+| Model accuracy                 | 88% (14/16) |
+| Policy override rate           | 13% (2/16)  |
+| Inconsistent on repeated input | 0           |
 
-<!-- V2: replace with actual output of runEvals() -->
+### Where it failed, and why that matters
 
-| Metric                         | Result    |
-| ------------------------------ | --------- |
-| Total runs                     | _pending_ |
-| Model accuracy                 | _pending_ |
-| Policy override rate           | _pending_ |
-| Inconsistent on repeated input | _pending_ |
+The two failures were **85%** and **55%** error rates. Both were classified
+`rollback` when policy requires `escalate`.
 
-**On what a good result looks like:** 100% model accuracy would be a bad
-outcome, not a good one. It would mean the task was simple enough that an
-`if/else` would have sufficed and both the LLM and the policy layer are dead
-weight. The value of this system is proportional to how often the model is
-wrong.
+The scenarios were designed around an assumption that turned out to be wrong.
+I expected failures at the decision boundaries — 39 vs 41 — because that is
+where a fuzzy classifier should struggle. The opposite happened. At 41% the
+model was correct on both runs, and its reasoning cited the rule directly:
+_"error rate exceeds 40%."_ The boundaries were its strongest region.
 
-**Measurement integrity:** `diagnose()` distinguishes an inference failure
-(quota, network, model unavailable) from a parse failure. Both fail safe to
-`escalate` in production. But evals abort rather than scoring an infrastructure
-error as a model decision — fail safe in production, fail loud in evaluation.
+It broke at the extremes instead. At 85% it reasoned _"error rate is extremely
+high at 85%"_ and then recommended `rollback` — it identified the severity
+correctly and still chose the less drastic action. Same failure at 55%.
+
+The plausible reading: near the threshold, the prompt's explicit rule is the
+only signal available, so the model follows it. At an extreme value, a prior
+from general training — _very high error rate means roll back_ — competes with
+the instruction and wins.
+
+**This is the argument for the policy layer.** A guardrail placed at the
+boundary, where you would expect a classifier to be weakest, would have caught
+nothing here. Both failures occurred where the model looks most confident and
+where a human reviewer would be least likely to double-check it. Policy caught
+both: `finalAction` was `escalate` in both cases.
+
+### On reproducibility
+
+`inconsistentValues` was empty — every repeated input produced the same
+recommendation. The model is deterministic on this task, so its errors are
+systematic rather than sampling noise. That is the more useful failure mode:
+a reproducible error can be characterised and written a rule against; a random
+one cannot.
+
+### On what a good result looks like
+
+100% model accuracy would have been a bad outcome. It would mean the task was
+simple enough for an `if/else` and that both the LLM and the policy layer are
+dead weight. 88% is the interesting regime — reliable enough to be useful,
+unreliable enough to be dangerous without a guardrail.
+
+### Measurement integrity
+
+`diagnose()` distinguishes an inference failure (quota, network, model
+unavailable) from a parse failure. Both fail safe to `escalate` in production,
+but evals abort rather than scoring an infrastructure error as a model decision
+— fail safe in production, fail loud in evaluation.
 
 ---
 
@@ -126,12 +159,11 @@ scheduler; Durable Objects are the primitive that makes that possible.
 self-rescheduled inside the handler and also scheduled from `onStart()`. Every
 Durable Object restart created another timer, so timers multiplied — the runtime
 eventually reported processing ten stale schedules in a single alarm cycle.
-`scheduleEvery()` is idempotent recurrence. This is a duplicate-scheduled-work
-bug, and it is the reason v2 moves to deterministic keys throughout.
+`scheduleEvery()` is idempotent recurrence. This duplicate-scheduled-work bug is what motivated deterministic keying throughout the system.
 
 **Deterministic incident keys.** Incidents are keyed on
 `service:metric:time-bucket` rather than a random UUID, so the same incident
-detected twice resolves to the same identity. The dedup check runs *before* the
+detected twice resolves to the same identity. The dedup check runs _before_ the
 LLM call — it prevents double-remediation, and it avoids paying for inference on
 an incident already diagnosed.
 
@@ -193,6 +225,10 @@ a fix** — it collapses the doubling but will also collapse legitimate repetiti
 It is applied only to assistant text; user input, stored incident data, and the
 non-streamed diagnosis path are unaffected.
 
+The workaround also mangles numbers in streamed output — the eval summary
+rendered as "1616 total runs" instead of 16. The raw tool output is
+authoritative, not the model's prose summary of it.
+
 **Simulated monitoring.** Anomalies are generated, not observed. There is no
 real telemetry source. The agent architecture is the subject here; wiring a real
 metrics source is a substitution, not a redesign.
@@ -216,8 +252,6 @@ development. No third-party API keys are needed.
 ## AI-assisted development
 
 Prompt history: [`docs/prompt-history.md`](docs/prompt-history.md)
-
-<!-- V2: expand once the full session is curated -->
 
 ---
 
