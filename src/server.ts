@@ -14,7 +14,7 @@ import { z } from "zod";
 type Action = "retry" | "rollback" | "escalate";
 
 type Incident = {
-  id: string;
+  key: string; // Deterministic: checkout-api:error_rate:5813402
   service: string;
   metric: string;
   value: number;
@@ -27,7 +27,7 @@ type Incident = {
 
 type DeployWatchState = {
   checksRun: number;
-  incidents: Incident[];
+  incidents: Record<string, Incident>;
 };
 
 const POLICY = {
@@ -45,6 +45,16 @@ function applyPolicy(
     };
   }
   return { finalAction: recommended, policyOverride: false };
+}
+
+// ── Deterministic incident keys ──────────────────────────────────────
+
+const WINDOW_SECONDS = 300; // 5 minutes
+
+function incidentKey(service: string, metric: string, timestamp: Date): string {
+  // Fixed bucket: chop time into 5-minute slots
+  const bucket = Math.floor(timestamp.getTime() / (WINDOW_SECONDS * 1000));
+  return `${service}:${metric}:${bucket}`;
 }
 
 // ── Evaluation scenarios ──────────────────────────────────────────────
@@ -84,7 +94,7 @@ const EVAL_CASES: { value: number; expected: Action }[] = [
 export class ChatAgent extends AIChatAgent<Env, DeployWatchState> {
   initialState: DeployWatchState = {
     checksRun: 0,
-    incidents: []
+    incidents: {}
   };
   maxPersistedMessages = 100;
   // Wait for MCP connections to be re-established after hibernation before
@@ -158,7 +168,10 @@ If the user asks to schedule a task, use the schedule tool to schedule the task.
             "Get the list of detected deployment incidents and the action taken for each",
           inputSchema: z.object({}),
           execute: async () => {
-            const recent = this.state.incidents.slice(-10);
+            const sorted = Object.values(this.state.incidents).sort((a, b) =>
+              a.detectedAt.localeCompare(b.detectedAt)
+            );
+            const recent = sorted.slice(-10);
             return recent.length > 0 ? recent : "No incidents detected yet.";
           }
         }),
@@ -357,40 +370,68 @@ Respond with ONLY valid JSON, no other text:
     const metric = "error_rate";
     const isAnomaly = Math.random() < 0.4;
 
-    if (isAnomaly) {
-      const value = Math.floor(Math.random() * 60) + 10;
+    // Increment checksRun regardless (tracking uptime)
+    const newChecksRun = this.state.checksRun + 1;
 
-      const diagnosis = await this.diagnose(service, metric, value);
-      const policy = applyPolicy(value, diagnosis.action);
-
-      const incident: Incident = {
-        id: crypto.randomUUID(),
-        service,
-        metric,
-        value,
-        detectedAt: new Date().toISOString(),
-        recommendedAction: diagnosis.action,
-        reasoning: diagnosis.reasoning,
-        finalAction: policy.finalAction,
-        policyOverride: policy.policyOverride
-      };
-
+    if (!isAnomaly) {
       this.setState({
-        checksRun: this.state.checksRun + 1,
-        incidents: [...this.state.incidents, incident]
+        checksRun: newChecksRun,
+        incidents: this.state.incidents // unchanged
       });
-
-      console.log(
-        `INCIDENT ${service} ${value}% | LLM: ${diagnosis.action} → FINAL: ${policy.finalAction}` +
-          (policy.policyOverride ? " [POLICY OVERRIDE]" : "")
-      );
-    } else {
-      this.setState({
-        checksRun: this.state.checksRun + 1,
-        incidents: this.state.incidents
-      });
-      console.log("Health check OK. Total checks:", this.state.checksRun);
+      console.log(`Health check OK. Total checks: ${newChecksRun}`);
+      return;
     }
+
+    // ── ANOMALY DETECTED ──────────────────────────────────────────────
+
+    const value = Math.floor(Math.random() * 60) + 10;
+    const now = new Date();
+
+    // 1. Compute the deterministic key
+    const key = incidentKey(service, metric, now);
+
+    // 2. Check if we already handled this exact incident
+    if (this.state.incidents[key]) {
+      // Dedup hit: skip the LLM entirely — saves neurons and prevents double-rollback
+      console.log(
+        `DEDUP HIT: ${key} already handled at ${this.state.incidents[key].detectedAt}. Skipping LLM.`
+      );
+      this.setState({
+        checksRun: newChecksRun,
+        incidents: this.state.incidents // unchanged
+      });
+      return;
+    }
+
+    // 3. New incident: run the full diagnose → policy → store flow
+    const diagnosis = await this.diagnose(service, metric, value);
+    const policy = applyPolicy(value, diagnosis.action);
+
+    const incident: Incident = {
+      key, // deterministic
+      service,
+      metric,
+      value,
+      detectedAt: now.toISOString(),
+      recommendedAction: diagnosis.action,
+      reasoning: diagnosis.reasoning,
+      finalAction: policy.finalAction,
+      policyOverride: policy.policyOverride
+    };
+
+    // 4. Store under the deterministic key (immutable update)
+    this.setState({
+      checksRun: newChecksRun,
+      incidents: {
+        ...this.state.incidents,
+        [key]: incident
+      }
+    });
+
+    console.log(
+      `INCIDENT ${service} ${value}% | LLM: ${diagnosis.action} → FINAL: ${policy.finalAction}` +
+        (policy.policyOverride ? " [POLICY OVERRIDE]" : "")
+    );
   }
 
   async executeTask(description: string, _task: Schedule<string>) {
